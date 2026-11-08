@@ -1,0 +1,200 @@
+# firefox_history_faker.ps1
+# Adds realistic fake entries to a Firefox profile's places.sqlite.
+# MUST have Firefox fully closed. Backs up places.sqlite first.
+
+$ErrorActionPreference = 'Stop'
+
+# ---------- MurmurHash64A (matches Firefox mozilla::HashBytes seed=0) ----------
+function Get-MurmurHash64A {
+    param([byte[]]$Data, [uint64]$Seed = 0)
+    $m = [uint64]0xC6A4A7935BD1E995
+    $r = 47
+    $len = [uint64]$Data.Length
+    $h = $Seed -bxor ([uint64]($len * $m))
+    $nblocks = [int]($len / 8)
+    for ($i = 0; $i -lt $nblocks; $i++) {
+        $k = [BitConverter]::ToUInt64($Data, $i * 8)
+        $k = [uint64]($k * $m)
+        $k = $k -bxor ($k -shr $r)
+        $k = [uint64]($k * $m)
+        $h = $h -bxor $k
+        $h = [uint64]($h * $m)
+    }
+    $tail = $len - [uint64]($nblocks * 8)
+    if ($tail -gt 0) {
+        for ($i = [int]$tail - 1; $i -ge 0; $i--) {
+            $h = $h -bxor ([uint64]$Data[$nblocks * 8 + $i] -shl (8 * $i))
+        }
+        $h = [uint64]($h * $m)
+    }
+    $h = $h -bxor ($h -shr $r)
+    $h = [uint64]($h * $m)
+    $h = $h -bxor ($h -shr $r)
+    return $h
+}
+
+# ---------- Firefox GUID ----------
+$script:GUIDAlphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_'
+function New-FirefoxGuid {
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt 12; $i++) {
+        [void]$sb.Append($script:GUIDAlphabet[(Get-Random -Maximum 64)])
+    }
+    return $sb.ToString()
+}
+
+# ---------- Helpers ----------
+function Get-HostFromUrl([string]$Url) {
+    $noScheme = $Url -replace '^[a-zA-Z]+://', ''
+    return ($noScheme -split '[/?#]')[0]
+}
+function Get-RevHost([string]$Host_) { return (-join ($Host_.ToCharArray() | ForEach-Object { $_ })[($Host_.Length - 1)..0]) + '.' }
+function ConvertTo-PrTime([datetime]$Dt) { return [int64]([DateTimeOffset]$Dt.ToUniversalTime()).ToUnixTimeMilliseconds() * 1000 }
+
+# ---------- Profile discovery ----------
+function Get-FirefoxProfiles {
+    $roots = @()
+    if ($env:APPDATA) { $roots += Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles' }
+    if ($env:LOCALAPPDATA) { $roots += Join-Path $env:LOCALAPPDATA 'Mozilla\Firefox\Profiles' }
+    $out = @()
+    foreach ($root in $roots) {
+        if (Test-Path $root) {
+            Get-ChildItem -Path $root -Directory | ForEach-Object {
+                if (Test-Path (Join-Path $_.FullName 'places.sqlite')) { $out += $_.FullName }
+            }
+        }
+    }
+    return $out
+}
+function Test-FirefoxRunning {
+    $p = Get-Process -Name firefox -ErrorAction SilentlyContinue
+    return ($null -ne $p)
+}
+
+# ---------- Load System.Data.SQLite ----------
+# Firefox places.sqlite is SQLite 3; use the System.Data.SQLite assembly shipped with
+# Windows PowerShell 5.1 is NOT present by default. Instead use the native sqlite3 if
+# available, or fall back to P/Invoke via Microsoft.Data.Sqlite. Simplest portable path:
+# use the built-in System.Data.SQLite? Not installed. So we call sqlite3.exe.
+function Invoke-Sqlite {
+    param([string]$DbPath, [string]$Sql)
+    $sqlite = Get-Command sqlite3.exe -ErrorAction SilentlyContinue
+    if (-not $sqlite) {
+        throw "sqlite3.exe not found in PATH. Download the 'sqlite-tools' zip from sqlite.org, add it to PATH, then re-run."
+    }
+    $tmp = [IO.Path]::GetTempFileName()
+    try {
+        Set-Content -Path $tmp -Value $Sql -Encoding UTF8
+        $out = & $sqlite.Source $DbPath ".read `"$tmp`"" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "sqlite3 failed: $out" }
+        return $out
+    } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+}
+
+# ---------- Sample site pool ----------
+$SampleSites = @(
+    @('https://www.google.com/search?q=weather+today', 'weather today - Google Search'),
+    @('https://www.google.com/search?q=best+noise+cancelling+headphones', 'best noise cancelling headphones - Google Search'),
+    @('https://www.youtube.com/feed/subscriptions', 'Subscriptions - YouTube'),
+    @('https://www.reddit.com/r/ProgrammerHumor/', 'r/ProgrammerHumor - Reddit'),
+    @('https://news.ycombinator.com/', 'Hacker News'),
+    @('https://github.com/', 'GitHub'),
+    @('https://stackoverflow.com/questions/tagged/sqlite', 'Newest ''sqlite'' questions - Stack Overflow'),
+    @('https://en.wikipedia.org/wiki/Firefox', 'Firefox - Wikipedia'),
+    @('https://en.wikipedia.org/wiki/SQLite', 'SQLite - Wikipedia'),
+    @('https://mail.google.com/mail/u/0/#inbox', 'Inbox - Gmail'),
+    @('https://www.amazon.com/', 'Amazon.com. Spend less. Smile more.'),
+    @('https://www.netflix.com/browse', 'Home - Netflix'),
+    @('https://duckduckgo.com/?q=python+sqlite+tutorial', 'python sqlite tutorial at DuckDuckGo'),
+    @('https://developer.mozilla.org/en-US/docs/Web/SQLite', 'SQLite - MDN Web Docs'),
+    @('https://www.ebay.com/', 'Electronics, Cars, Fashion, Collectibles & More | eBay')
+)
+
+# ---------- Main ----------
+function Invoke-FirefoxHistoryFaker {
+    param(
+        [string]$ProfilePath,
+        [int]$Days = 30,
+        [int]$Count = 20,
+        [string[]]$Urls
+    )
+
+    if (Test-FirefoxRunning) {
+        throw "Firefox is running. Close it fully (check Task Manager for firefox.exe) and re-run."
+    }
+
+    $profiles = Get-FirefoxProfiles
+    if (-not $ProfilePath) {
+        if ($profiles.Count -eq 0) { throw "No Firefox profile found." }
+        if ($profiles.Count -eq 1) { $ProfilePath = $profiles[0] }
+        else {
+            Write-Host "Multiple profiles:"
+            for ($i = 0; $i -lt $profiles.Count; $i++) { Write-Host "  [$($i+1)] $($profiles[$i])" }
+            $sel = Read-Host "Pick a number"
+            $ProfilePath = $profiles[[int]$sel - 1]
+        }
+    }
+
+    $places = Join-Path $ProfilePath 'places.sqlite'
+    if (-not (Test-Path $places)) { throw "places.sqlite not found in $ProfilePath" }
+
+    $backup = "$places.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    Copy-Item -Path $places -Destination $backup -Force
+    Write-Host "Backed up -> $backup"
+
+    # Build entry list
+    if ($Urls) {
+        $entries = $Urls | ForEach-Object { ,@($_, (Get-HostFromUrl $_)) }
+    } else {
+        $pool = $SampleSites | Get-Random -Count ([Math]::Min($Count, $SampleSites.Count))
+        $entries = $pool
+    }
+
+    $now = [datetime]::UtcNow
+    $start = $now.AddDays(-$Days)
+
+    $sql = New-Object System.Text.StringBuilder
+    [void]$sql.AppendLine('BEGIN TRANSACTION;')
+
+    foreach ($entry in $entries) {
+        $url = $entry[0]
+        $title = $entry[1] -replace "'", "''"
+        $urlEsc = $url -replace "'", "''"
+        $host_ = Get-HostFromUrl $url
+        $revHost = Get-RevHost $host_
+        $urlHash = Get-MurmurHash64A ([Text.Encoding]::UTF8.GetBytes($url)) 0
+        $guid = New-FirefoxGuid
+        $visitCount = Get-Random -Minimum 1 -Maximum 7
+
+        # Random visit times in window
+        $stamps = @()
+        for ($i = 0; $i -lt $visitCount; $i++) {
+            $offsetSec = Get-Random -Minimum 0 -Maximum ([int]($now - $start).TotalSeconds)
+            $stamps += ConvertTo-PrTime $start.AddSeconds($offsetSec)
+        }
+        $stamps = $stamps | Sort-Object
+        $lastVisit = ($stamps | Measure-Object -Maximum).Maximum
+
+        $typed = if ((Get-Random -Maximum 100) -lt 15) { 1 } else { 0 }
+
+        # Insert place
+        [void]$sql.AppendLine(@"
+INSERT INTO moz_places (url, title, rev_host, visit_count, hidden, typed, frecency, last_visit_date, guid, foreign_count, url_hash)
+VALUES ('$urlEsc', '$title', '$revHost', $visitCount, 0, $typed, $($visitCount * 100), $lastVisit, '$guid', 0, $urlHash);
+"@)
+
+        # Insert visits
+        foreach ($ts in $stamps) {
+            [void]$sql.AppendLine("INSERT INTO moz_historyvisits (from_visit, place_id, visit_date, visit_type, session) VALUES (0, (SELECT id FROM moz_places WHERE url_hash = $urlHash), $ts, 1, 0);")
+        }
+    }
+
+    [void]$sql.AppendLine('COMMIT;')
+
+    Invoke-Sqlite -DbPath $places -Sql $sql.ToString()
+    Write-Host "Inserted $($entries.Count) fake history entries."
+    Write-Host "Open Firefox -> Ctrl+H to check."
+}
+
+# ---------- Run with defaults when piped into iex ----------
+Invoke-FirefoxHistoryFaker -Days 30 -Count 20
